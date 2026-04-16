@@ -113,6 +113,20 @@ class RedisSessionStore(SessionStore):
             session.session_token = security.compute_session_token(session, env)
         self.save(session)
 
+    def get_missing_session_identifiers(self, sids):
+        """Return session identifiers that no longer exist in Redis.
+
+        Called by res.device autovacuum (Odoo 18+) to mark device logs
+        as revoked when their session has expired.
+        """
+        if not sids:
+            return set()
+        pipeline = self.redis.pipeline()
+        for sid in sids:
+            pipeline.exists(self.build_key(sid))
+        results = pipeline.execute()
+        return {sid for sid, exists in zip(sids, results) if not exists}
+
     def vacuum(self, *args, **kwargs):
         """Do not garbage collect the sessions
 
