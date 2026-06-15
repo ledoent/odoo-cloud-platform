@@ -4,7 +4,6 @@ exclude: |
   ^base_fileurl_field/|
   ^cloud_platform/|
   ^logging_json/|
-  ^monitoring_log_requests/|
   ^monitoring_prometheus/|
   ^monitoring_statsd/|
   ^monitoring_status/|
