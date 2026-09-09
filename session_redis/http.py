@@ -3,6 +3,7 @@
 import functools
 import logging
 import os
+import shutil
 
 from odoo import http
 from odoo.tools import config
@@ -78,16 +79,35 @@ def session_store(self):
 
 
 def purge_fs_sessions(path):
+    """Remove the filesystem sessions left behind before Redis took over.
+
+    Odoo's filesystem session store keeps sessions in two-character
+    subdirectories, so the entries are directories as well as files.
+    """
     if not os.path.isdir(path):
-        _logger.warning(f"Session directory '{path}' does not exist.")
+        _logger.warning("Session directory '%s' does not exist.", path)
         return
 
-    for fname in os.listdir(path):
-        path = os.path.join(path, fname)
+    entries = os.listdir(path)
+    failed = 0
+    for fname in entries:
+        entry = os.path.join(path, fname)
         try:
-            os.unlink(path)
+            if os.path.isdir(entry) and not os.path.islink(entry):
+                shutil.rmtree(entry)
+            else:
+                os.unlink(entry)
         except OSError:
-            _logger.warning("OS Error during purge of redis sessions.")
+            failed += 1
+            _logger.debug("Could not remove '%s'", entry, exc_info=True)
+    if failed:
+        _logger.warning(
+            "Could not purge %d of %d entries in the filesystem session "
+            "directory '%s'.",
+            failed,
+            len(entries),
+            path,
+        )
 
 
 if is_true(os.getenv("ODOO_SESSION_REDIS")):
