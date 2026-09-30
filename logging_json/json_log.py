@@ -7,7 +7,7 @@ import sys
 import threading
 import uuid
 
-from odoo import http
+from odoo.http import requestlib
 
 from .strtobool import strtobool
 
@@ -27,7 +27,6 @@ def is_true(strval):
 class OdooJsonFormatter(JsonFormatter):
     def add_fields(self, log_record, record, message_dict):
         record.pid = os.getpid()
-        record.dbname = getattr(threading.current_thread(), "dbname", "?")
         record.request_id = getattr(threading.current_thread(), "request_uuid", None)
         record.uid = getattr(threading.current_thread(), "uid", None)
         _super = super()
@@ -74,7 +73,7 @@ if is_true(os.environ.get("ODOO_LOGGING_JSON")):
 
 
 # monkey patch Request constructor to store request_uuid
-org_init = http.Request.__init__
+org_init = requestlib.Request.__init__
 
 
 def new_init(self, httprequest):
@@ -82,4 +81,4 @@ def new_init(self, httprequest):
     threading.current_thread().request_uuid = uuid.uuid4()
 
 
-http.Request.__init__ = new_init
+requestlib.Request.__init__ = new_init
