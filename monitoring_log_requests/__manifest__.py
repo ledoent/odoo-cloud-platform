@@ -4,7 +4,7 @@
 
 {
     "name": "Monitoring: Requests Logging",
-    "version": "19.0.1.0.0",
+    "version": "20.0.1.0.0",
     "author": "Camptocamp,Numigi,Odoo Community Association (OCA)",
     "license": "AGPL-3",
     "category": "Monitoring",
