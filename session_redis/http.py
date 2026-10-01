@@ -1,10 +1,10 @@
 # Copyright 2016-2024 Camptocamp SA
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl.html)
-import functools
 import logging
 import os
+import shutil
 
-from odoo import http
+from odoo.http import session as http_session
 from odoo.tools import config
 
 from .session import RedisSessionStore
@@ -45,49 +45,77 @@ ssl_cert_reqs = os.getenv("ODOO_SESSION_REDIS_SSL_CERT_REQS", "1")
 redis_cluster = os.getenv("ODOO_SESSION_REDIS_CLUSTER", "0")
 
 
-@functools.cached_property
-def session_store(self):
+def build_redis_client():
     if sentinel_host:
         sentinel = Sentinel([(sentinel_host, sentinel_port)], password=password)
-        redis_client = sentinel.master_for(sentinel_master_name)
-    elif url:
-        redis_client = redis.from_url(url)
-    elif is_true(redis_cluster):
-        redis_client = redis.RedisCluster(
+        return sentinel.master_for(sentinel_master_name)
+    if url:
+        return redis.from_url(url)
+    if is_true(redis_cluster):
+        return redis.RedisCluster(
             host=host,
             port=port,
             password=password,
             ssl=is_true(ssl),
             ssl_cert_reqs=is_true(ssl_cert_reqs),
         )
-    else:
-        redis_client = redis.Redis(
-            host=host,
-            port=port,
-            password=password,
-            ssl=is_true(ssl),
-            ssl_cert_reqs=is_true(ssl_cert_reqs),
-        )
-    return RedisSessionStore(
-        redis=redis_client,
-        prefix=prefix,
-        expiration=expiration,
-        anon_expiration=anon_expiration,
-        session_class=http.Session,
+    return redis.Redis(
+        host=host,
+        port=port,
+        password=password,
+        ssl=is_true(ssl),
+        ssl_cert_reqs=is_true(ssl_cert_reqs),
     )
 
 
+class ConfiguredRedisSessionStore(RedisSessionStore):
+    """RedisSessionStore pre-bound to the environment's Redis settings.
+
+    20.0 builds the store itself, as ``SessionStore(path=config.session_dir)``,
+    so the connection settings cannot be passed in at the call site any more.
+    """
+
+    def __init__(self, path=None, session_cls=http_session.Session):
+        super().__init__(
+            build_redis_client(),
+            path=path,
+            session_cls=session_cls,
+            prefix=prefix,
+            expiration=expiration,
+            anon_expiration=anon_expiration,
+        )
+
+
 def purge_fs_sessions(path):
+    """Remove the filesystem sessions left behind before Redis took over.
+
+    Odoo's filesystem session store keeps sessions in two-character
+    subdirectories, so the entries are directories as well as files.
+    """
     if not os.path.isdir(path):
-        _logger.warning(f"Session directory '{path}' does not exist.")
+        _logger.warning("Session directory '%s' does not exist.", path)
         return
 
-    for fname in os.listdir(path):
-        path = os.path.join(path, fname)
+    entries = os.listdir(path)
+    failed = 0
+    for fname in entries:
+        entry = os.path.join(path, fname)
         try:
-            os.unlink(path)
+            if os.path.isdir(entry) and not os.path.islink(entry):
+                shutil.rmtree(entry)
+            else:
+                os.unlink(entry)
         except OSError:
-            _logger.warning("OS Error during purge of redis sessions.")
+            failed += 1
+            _logger.debug("Could not remove '%s'", entry, exc_info=True)
+    if failed:
+        _logger.warning(
+            "Could not purge %d of %d entries in the filesystem session "
+            "directory '%s'.",
+            failed,
+            len(entries),
+            path,
+        )
 
 
 if is_true(os.getenv("ODOO_SESSION_REDIS")):
@@ -105,15 +133,16 @@ if is_true(os.getenv("ODOO_SESSION_REDIS")):
             host,
             port,
         )
-    http.Application.session_store = session_store
-    # cached_property needs __set_name__ to be called, but it is not called
-    # automatically since we are attaching the property after instance creation.
-    # So we have to do it manually
-    # See: https://docs.python.org/3/reference/datamodel.html#object.__set_name__
-    # Credit: https://stackoverflow.com/a/62161136
-    http.Application.session_store.__set_name__(
-        http.Application,
-        "session_store",
-    )
+    # 20.0 moved the store off the WSGI application: it is now built by the
+    # module-level odoo.http.session.session_store(), whose body is
+    # `return SessionStore(path=config.session_dir)`. That name is resolved as
+    # a global at call time, so rebinding the class here reaches every caller
+    # -- including odoo.http.dispatcher, odoo.http.router and
+    # odoo.tests.common, which all import the *function* by value and so
+    # cannot be reached by patching session_store itself.
+    http_session.SessionStore = ConfiguredRedisSessionStore
+    # session_store() is functools.cache'd, so drop anything a caller built
+    # from the filesystem store before we got loaded.
+    http_session.session_store.cache_clear()
     # clean the existing sessions on the file system
     purge_fs_sessions(config.session_dir)
