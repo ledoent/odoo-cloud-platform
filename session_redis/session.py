@@ -4,13 +4,18 @@
 import builtins
 import json
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 from typing import TypeAlias
 
 from odoo.http.session import (
     SESSION_LIFETIME,
+    STORED_SESSION_BYTES,
     Session,
     SessionStore,
     _session_identifier_re,
+    get_default_session,
 )
 
 from . import json_encoding
@@ -19,7 +24,26 @@ from . import json_encoding
 # odoo.http.session_gc()
 DEFAULT_SESSION_TIMEOUT_ANONYMOUS = 60 * 60 * 3  # 3 hours in seconds
 
+# A hard-deleted SID must not be recreated by a request already in flight.
+# Keep the marker for at least a full session lifetime. It contains no user data.
+_REVOKED = b"revoked-session"
+_SAVE_UNLESS_REVOKED = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
 _logger = logging.getLogger(__name__)
+_HELD_LOCKS = ContextVar("redis_session_locks", default=frozenset())
+
+
+def _guarded(method):
+    @wraps(method)
+    def guarded(self, session, *args, **kwargs):
+        with self._session_lock(session.sid[:STORED_SESSION_BYTES]):
+            return method(self, session, *args, **kwargs)
+
+    return guarded
 
 
 # Many parts of the session store API operate not on full session keys, but only
@@ -60,7 +84,28 @@ class RedisSessionStore(SessionStore):
     def build_key(self, sid):
         return f"{self.prefix}{sid}"
 
+    @contextmanager
+    def _session_lock(self, identifier):
+        key = f"{self.prefix}lock:{identifier}"
+        held = _HELD_LOCKS.get()
+        if key in held:
+            yield
+            return
+        # Bound the wait and fail closed if Redis cannot serialize a rotation.
+        with self.redis.lock(key, timeout=30, blocking_timeout=5):
+            token = _HELD_LOCKS.set(held | {key})
+            try:
+                yield
+            finally:
+                _HELD_LOCKS.reset(token)
+
+    def _is_revoked(self, sid):
+        return self.redis.exists(f"{self.prefix}revoked:{sid[:STORED_SESSION_BYTES]}")
+
+    @_guarded
     def save(self, session):
+        if self._is_revoked(session.sid):
+            return 0
         key = self.build_key(session.sid)
 
         # If the session has a deletion_time, it is slated for rotation, and
@@ -93,16 +138,39 @@ class RedisSessionStore(SessionStore):
         data = json.dumps(dict(session), cls=json_encoding.SessionEncoder).encode(
             "utf-8"
         )
-        if self.redis.set(key, data):
-            if not (expiration and isinstance(expiration, int)):
-                expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
-                expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
-            return self.redis.expire(key, expiration)
+        if not (expiration and isinstance(expiration, int)):
+            expiration = DEFAULT_SESSION_TIMEOUT_ANONYMOUS
+        # One key and one atomic operation: also works with Redis Cluster.
+        return self.redis.eval(_SAVE_UNLESS_REVOKED, 1, key, _REVOKED, data, expiration)
 
+    def _revoke_keys(self, keys):
+        lifetime = max(
+            SESSION_LIFETIME,
+            int(self.expiration or SESSION_LIFETIME),
+            int(self.anon_expiration or DEFAULT_SESSION_TIMEOUT_ANONYMOUS),
+        )
+        # Each SET is atomic; an older save can never overwrite its marker.
+        for key in keys:
+            self.redis.set(key, _REVOKED, ex=lifetime)
+
+    def _revoke_family(self, identifier):
+        with self._session_lock(identifier):
+            lifetime = max(SESSION_LIFETIME, int(self.expiration or SESSION_LIFETIME))
+            self.redis.set(f"{self.prefix}revoked:{identifier}", _REVOKED, ex=lifetime)
+            self._revoke_keys(self.redis.scan_iter(match=f"{self.prefix}{identifier}*"))
+
+    @_guarded
     def delete(self, session):
-        key = self.build_key(session.sid)
-        _logger.debug(f"deleting session with key {key}")
-        return self.redis.delete(key)
+        self._revoke_family(session.sid[:STORED_SESSION_BYTES])
+
+    @_guarded
+    def rotate(self, session, env, *, soft=False):
+        if self._is_revoked(session.sid):
+            db = session.db
+            session.clear()
+            session.update(get_default_session(), db=db)
+            soft = False
+        return super().rotate(session, env, soft=soft)
 
     def get(self, sid, *, keep_sid=False):
         if not self.is_valid_session_id(sid):
@@ -111,10 +179,12 @@ class RedisSessionStore(SessionStore):
             )
             return self.new()
 
+        if self._is_revoked(sid):
+            return self.new()
         key = self.build_key(sid)
         saved = self.redis.get(key)
-        if not saved:
-            if keep_sid:
+        if not saved or saved == _REVOKED:
+            if keep_sid and saved != _REVOKED:
                 _logger.debug(
                     f"session with non-existent key '{key}' has been asked, "
                     "returning an empty one"
@@ -138,7 +208,13 @@ class RedisSessionStore(SessionStore):
     def list(self):
         keys = self.redis.keys(f"{self.prefix}*")
         _logger.debug("a listing redis keys has been called")
-        return [key[len(self.prefix) :] for key in keys]
+        return [
+            key[len(self.prefix) :]
+            for key in keys
+            if self.is_valid_session_id(key[len(self.prefix) :].decode())
+            and not self._is_revoked(key[len(self.prefix) :].decode())
+            and self.redis.get(key) not in (None, _REVOKED)
+        ]
 
     def vacuum(self, *args, **kwargs):
         """Do not garbage collect the sessions
@@ -177,7 +253,9 @@ class RedisSessionStore(SessionStore):
         for partial_sid in identifiers:
             key = f"{self.prefix}{partial_sid}*"
             match = self.redis.keys(pattern=key)
-            if not match:
+            if self._is_revoked(partial_sid) or not any(
+                self.redis.get(key) not in (None, _REVOKED) for key in match
+            ):
                 not_found.add(partial_sid)
         return not_found
 
@@ -189,15 +267,7 @@ class RedisSessionStore(SessionStore):
         defined on the file session store, and is used by devices when revoking
         device sessions (see odoo.addons.base.models.res_device.ResDevice._revoke).
         """
-        patterns_to_unlink = []
         for identifier in identifiers:
-            # Avoid removing a session if it does not match an identifier. See this same
-            # comment in odoo.http.session.SessionStore.delete_from_identifiers.
-            if not _session_identifier_re.match(identifier):
+            if not _session_identifier_re.fullmatch(identifier):
                 continue
-            patterns_to_unlink.append(f"{self.prefix}{identifier}*")
-        keys_to_unlink = []
-        for pattern in patterns_to_unlink:
-            keys_to_unlink.extend(self.redis.scan_iter(match=pattern))
-        if keys_to_unlink:
-            self.redis.delete(*keys_to_unlink)
+            self._revoke_family(identifier)
