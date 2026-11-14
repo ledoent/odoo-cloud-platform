@@ -15,6 +15,7 @@ from odoo.addons.session_redis.session import RedisSessionStore
 @unittest.skipUnless(os.getenv("REDIS_TEST_HOST"), "requires disposable Redis")
 class SessionRevocation(unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.redis = redis.Redis(host=os.environ["REDIS_TEST_HOST"])
         self.store = RedisSessionStore(redis=self.redis, prefix="test-" + uuid4().hex)
         self.session = self.store.new()
@@ -22,6 +23,7 @@ class SessionRevocation(unittest.TestCase):
         self.store.save(self.session)
 
     def tearDown(self):
+        super().tearDown()
         keys = list(self.redis.scan_iter(match=self.store.prefix + "*"))
         if keys:
             self.redis.delete(*keys)
@@ -112,10 +114,12 @@ class SessionRevocation(unittest.TestCase):
                 barrier.wait()
                 self.store.delete(current)
 
-            with patch("odoo.http.session.update_session_token"):
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    futures = [executor.submit(rotate), executor.submit(logout)]
-                    for future in futures:
-                        future.result()
+            with (
+                patch("odoo.http.session.update_session_token"),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [executor.submit(rotate), executor.submit(logout)]
+                for future in futures:
+                    future.result()
             self.assertIsNone(self.store.get(current.sid).uid)
             self.assertIsNone(self.store.get(stale.sid).uid)
